@@ -1,0 +1,181 @@
+name: bucket-encode
+
+run-name: "${{ inputs.source_path }} -> ${{ inputs.output_name }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      bucket:
+        description: "HF bucket (owner/name)"
+        default: "Angelrider/video-encodes"
+        required: true
+      source_path:
+        description: "Path of the source file inside the bucket"
+        default: "American.Psycho.2000.Unrated.2160p.UHD.BluRay.x265.HDR.DV.DD+7.1.Atmos-Pahe.in.mkv"
+        required: true
+      output_name:
+        description: "Filename for the encoded result (written to bucket root)"
+        default: "american-psycho-2000-encode.mkv"
+        required: true
+      segments:
+        description: "Number of parallel encode jobs (<=18 to stay inside Free concurrency)"
+        default: "8"
+        required: true
+      clip_seconds:
+        description: "Encode only N seconds from the start of each segment (0 = full segments)"
+        default: "60"
+        required: true
+      encoder_args:
+        description: "ffmpeg encoder args applied identically to every segment (video only; audio is stream-copied at merge)"
+        default: "-c:v libx265 -preset medium -crf 24 -pix_fmt yuv420p10le"
+        required: true
+
+concurrency:
+  group: bucket-encode-${{ inputs.bucket }}/${{ inputs.source_path }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      n: ${{ steps.plan.outputs.n }}
+      source_url: ${{ steps.plan.outputs.source_url }}
+    steps:
+      - name: Ensure ffmpeg
+        run: command -v ffprobe >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+
+      - name: Probe source and build segment matrix
+        id: plan
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          BUCKET: ${{ inputs.bucket }}
+          SOURCE_PATH: ${{ inputs.source_path }}
+          SEGMENTS: ${{ inputs.segments }}
+          CLIP_SECONDS: ${{ inputs.clip_seconds }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, urllib.parse
+
+          bucket = os.environ["BUCKET"]
+          path = os.environ["SOURCE_PATH"]
+          url = f"https://huggingface.co/buckets/{bucket}/resolve/{urllib.parse.quote(path, safe='/')}"
+          auth = "Authorization: Bearer " + os.environ["HF_TOKEN"]
+
+          probe = subprocess.run(
+              ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+               "-of", "csv=p=0", "-headers", auth + "\r\n", url],
+              check=True, capture_output=True, text=True,
+          )
+          dur = float(probe.stdout.strip())
+          n = int(os.environ["SEGMENTS"])
+          clip = float(os.environ["CLIP_SECONDS"])
+          step = dur / n
+
+          parts = []
+          for i in range(n):
+              start = i * step
+              full = step if i < n - 1 else dur - start
+              encode_dur = min(clip, full) if clip > 0 else full
+              parts.append({"i": i, "start": round(start, 3), "dur": round(encode_dur, 3)})
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={json.dumps({'part': parts})}\n")
+              f.write(f"n={n}\n")
+              f.write(f"source_url={url}\n")
+          print(f"duration={dur:.3f}s segments={n} step={step:.3f}s clip={clip}s")
+          PY
+
+  encode:
+    needs: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.probe.outputs.matrix) }}
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      BUCKET: ${{ inputs.bucket }}
+      ENCODER_ARGS: ${{ inputs.encoder_args }}
+    steps:
+      - name: Ensure ffmpeg + hf
+        run: |
+          command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          python3 -m pip install --user -U huggingface_hub
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Encode segment
+        run: |
+          NAME=$(printf 'part_%03d.mkv' "${{ matrix.part.i }}")
+          AUTH=$(printf 'Authorization: Bearer %s\r\n' "$HF_TOKEN")
+          ffmpeg -y -v warning \
+            -ss "${{ matrix.part.start }}" \
+            -headers "$AUTH" \
+            -i "${{ needs.probe.outputs.source_url }}" \
+            -t "${{ matrix.part.dur }}" \
+            -map 0:v:0 -an -sn \
+            $ENCODER_ARGS \
+            "$NAME"
+          ls -la "$NAME"
+
+      - name: Upload segment to bucket
+        run: |
+          NAME=$(printf 'part_%03d.mkv' "${{ matrix.part.i }}")
+          hf buckets cp "$NAME" "hf://buckets/$BUCKET/parts/${{ github.run_id }}/$NAME"
+
+  merge:
+    needs: [probe, encode]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      BUCKET: ${{ inputs.bucket }}
+      OUTPUT_NAME: ${{ inputs.output_name }}
+      N: ${{ needs.probe.outputs.n }}
+      SOURCE_URL: ${{ needs.probe.outputs.source_url }}
+    steps:
+      - name: Ensure ffmpeg + hf
+        run: |
+          command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          python3 -m pip install --user -U huggingface_hub
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download segments
+        run: |
+          mkdir parts
+          for i in $(seq 0 $((N - 1))); do
+            f=$(printf 'part_%03d.mkv' "$i")
+            hf buckets cp "hf://buckets/$BUCKET/parts/${{ github.run_id }}/$f" "parts/$f"
+          done
+          du -sh parts
+
+      - name: Check disk headroom
+        run: |
+          parts_bytes=$(du -sb parts | cut -f1)
+          free_bytes=$(df -B1 --output=avail . | tail -1 | tr -dc '0-9')
+          need_bytes=$((parts_bytes * 2 + 2147483648))
+          echo "parts=$((parts_bytes / 1073741824))G free=$((free_bytes / 1073741824))G need≈$((need_bytes / 1073741824))G"
+          if [ "$need_bytes" -gt "$free_bytes" ]; then
+            echo "::error::Not enough disk for concat (parts + output must fit in ~14GB runner)."
+            echo "Merge locally instead: hf buckets sync hf://buckets/$BUCKET/parts/${{ github.run_id }} ./parts"
+            echo "then: ffmpeg -f concat -safe 0 -i list.txt -i \"$SOURCE_URL\" -map 0:v:0 -map 1:a:0? -c copy -shortest \"$OUTPUT_NAME\""
+            exit 1
+          fi
+
+      - name: Concatenate and mux audio from source
+        run: |
+          AUTH=$(printf 'Authorization: Bearer %s\r\n' "$HF_TOKEN")
+          (cd parts && for f in part_*.mkv; do echo "file '$PWD/$f'"; done) > list.txt
+          cat list.txt
+          ffmpeg -v error -f concat -safe 0 -i list.txt \
+            -headers "$AUTH" -i "$SOURCE_URL" \
+            -map 0:v:0 -map 1:a:0? -c copy -shortest \
+            -y "$OUTPUT_NAME"
+          ffprobe -v error -show_entries format=duration,size -of json "$OUTPUT_NAME"
+
+      - name: Upload result
+        run: hf buckets cp "$OUTPUT_NAME" "hf://buckets/$BUCKET/$OUTPUT_NAME"
+
+      - name: Clean up segments
+        run: hf buckets rm "$BUCKET/parts/${{ github.run_id }}" --recursive --yes
