@@ -26,8 +26,8 @@ on:
         default: "0"
         required: true
       encoder_args:
-        description: "ffmpeg encoder args applied identically to every segment (video only; audio/subs are stream-copied at merge)"
-        default: "-c:v libx265 -preset medium -crf 20 -pix_fmt yuv420p10le -vf scale=1920:1080:flags=lanczos"
+        description: "ffmpeg encoder args applied identically to every segment (must keep 1080p + 10-bit; video-only output)"
+        default: "-c:v libx265 -preset fast -crf 20 -pix_fmt yuv420p10le -vf scale=1920:1080:flags=bicubic -x265-params pools=4:frame-threads=3:pmode=1:pme=1:keyint=240:min-keyint=24:open-gop=0:repeat-headers=1:info=0"
         required: true
 
 concurrency:
@@ -98,35 +98,56 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       BUCKET: ${{ inputs.bucket }}
       ENCODER_ARGS: ${{ inputs.encoder_args }}
+      N: ${{ needs.probe.outputs.n }}
     steps:
       - name: Ensure ffmpeg + hf
         run: |
-          command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          echo "=== Encode worker: part ${{ matrix.part.i }} of $N ==="
+          command -v ffmpeg >/dev/null && ffmpeg -hide_banner -version | head -1 || echo "ffmpeg missing, installing..."
+          command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg)
+          ffmpeg -hide_banner -version | head -1
           python3 -m pip install --user -U huggingface_hub
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Encode segment
         run: |
           NAME=$(printf 'part_%03d.mkv' "${{ matrix.part.i }}")
+          echo "=== Part ${{ matrix.part.i }} / $N ==="
+          echo "start=${{ matrix.part.start }}s dur=${{ matrix.part.dur }}s"
+          echo "args: $ENCODER_ARGS"
+          START_TS=$(date +%s)
           for attempt in 1 2 3; do
-            if ffmpeg -y -v warning \
+            if ffmpeg -y -hide_banner -stats -stats_period 30 \
               -ss "${{ matrix.part.start }}" \
               -headers "Authorization: Bearer $HF_TOKEN" \
               -i "${{ needs.probe.outputs.source_url }}" \
               -t "${{ matrix.part.dur }}" \
               -map 0:v:0 -an -sn \
               $ENCODER_ARGS \
-              "$NAME"; then
+              "$NAME" 2>&1; then
               break
             fi
             echo "ffmpeg attempt $attempt failed, retrying in 10s..."
             sleep 10
             [ "$attempt" = 3 ] && exit 1
           done
+          END_TS=$(date +%s)
+          WALL=$((END_TS - START_TS))
+          echo "=== Part ${{ matrix.part.i }} done in ${WALL}s ==="
           ls -lh "$NAME"
-          # validate part: must exist, non-empty, and have video duration > 0
           test -s "$NAME"
-          ffprobe -v error -show_entries format=duration -of csv=p=0 "$NAME"
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$NAME" | tr -dc '0-9.')
+          SIZE_MB=$(($(stat -c%s "$NAME" 2>/dev/null || stat -f%z "$NAME") / 1048576))
+          echo "part_duration=${DUR}s size=${SIZE_MB}MB wall=${WALL}s"
+          {
+            echo "## Part ${{ matrix.part.i }} (start ${{ matrix.part.start }}s)"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| wall time | ${WALL}s |"
+            echo "| part duration | ${DUR}s |"
+            echo "| size | ${SIZE_MB} MB |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload segment to bucket
         run: |
@@ -159,37 +180,52 @@ jobs:
 
       - name: Download segments
         run: |
-          mkdir parts
-          for i in $(seq 0 $((N - 1))); do
-            f=$(printf 'part_%03d.mkv' "$i")
+          echo "=== Downloading $N parts (4 parallel) ==="
+          mkdir -p parts
+          seq 0 $((N - 1)) | xargs -P4 -I{} bash -c '
+            f=$(printf "part_%03d.mkv" "{}")
+            echo "-> $f"
             hf buckets cp "hf://buckets/$BUCKET/parts/${{ github.run_id }}/$f" "parts/$f"
-          done
+          '
+          echo "=== Parts on disk ==="
+          ls -lh parts | head -n 30
           du -sh parts
+          echo "count=$(ls parts/part_*.mkv 2>/dev/null | wc -l) expected=$N"
 
       - name: Check disk headroom
         run: |
           parts_bytes=$(du -sb parts | cut -f1)
           free_bytes=$(df -B1 --output=avail . | tail -1 | tr -dc '0-9')
-          need_bytes=$((parts_bytes * 2 + 2147483648))
+          need_bytes=$((parts_bytes * 2 + 1073741824))
           echo "parts=$((parts_bytes / 1073741824))G free=$((free_bytes / 1073741824))G need≈$((need_bytes / 1073741824))G"
           if [ "$need_bytes" -gt "$free_bytes" ]; then
             echo "::error::Not enough disk for concat (parts + output must fit in ~14GB runner)."
             echo "Merge locally instead: hf buckets sync hf://buckets/$BUCKET/parts/${{ github.run_id }} ./parts"
-            echo "then: ffmpeg -f concat -safe 0 -i list.txt -i \"$SOURCE_URL\" -map 0:v:0 -map 1:a -map 1:s? -c copy -shortest \"$OUTPUT_NAME\""
+            echo 'then: (cd parts && for f in part_*.mkv; do echo "file '"'"'$PWD/$f'"'"'"; done) > list.txt && ffmpeg -f concat -safe 0 -i list.txt -c copy OUTPUT.mkv'
             exit 1
           fi
 
-      - name: Concatenate and mux audio + subtitles from source
+      - name: Concatenate video-only (1080p 10-bit)
         run: |
+          echo "=== Concat $N parts -> $OUTPUT_NAME (video-only) ==="
           (cd parts && for f in part_*.mkv; do echo "file '$PWD/$f'"; done) > list.txt
           cat list.txt
-          ffmpeg -v error -f concat -safe 0 -i list.txt \
-            -headers "Authorization: Bearer $HF_TOKEN" -i "$SOURCE_URL" \
-            -map 0:v:0 -map 1:a -map 1:s? -c copy -shortest \
-            -y "$OUTPUT_NAME"
-          echo "--- streams ---"
-          ffprobe -v error -show_entries stream=index,codec_name,codec_type,width,height -of flat "$OUTPUT_NAME"
+          START_TS=$(date +%s)
+          ffmpeg -y -hide_banner -stats -stats_period 10 -f concat -safe 0 -i list.txt -c copy "$OUTPUT_NAME" 2>&1
+          END_TS=$(date +%s)
+          echo "concat done in $((END_TS - START_TS))s"
+          ls -lh "$OUTPUT_NAME"
+          echo "--- streams (must be 1920x1080 hevc) ---"
+          ffprobe -v error -show_entries stream=index,codec_name,codec_type,width,height,pix_fmt -of flat "$OUTPUT_NAME"
           ffprobe -v error -show_entries format=duration,size -of json "$OUTPUT_NAME"
+          {
+            echo "## Merge result"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| parts | $N |"
+            echo "| size | $(du -h "$OUTPUT_NAME" | cut -f1) |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload result
         run: hf buckets cp "$OUTPUT_NAME" "hf://buckets/$BUCKET/$OUTPUT_NAME"
