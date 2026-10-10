@@ -108,10 +108,9 @@ jobs:
       - name: Encode segment
         run: |
           NAME=$(printf 'part_%03d.mkv' "${{ matrix.part.i }}")
-          AUTH=$(printf 'Authorization: Bearer %s\r\n' "$HF_TOKEN")
           ffmpeg -y -v warning \
             -ss "${{ matrix.part.start }}" \
-            -headers "$AUTH" \
+            -headers "Authorization: Bearer $HF_TOKEN" \
             -i "${{ needs.probe.outputs.source_url }}" \
             -t "${{ matrix.part.dur }}" \
             -map 0:v:0 -an -sn \
@@ -165,11 +164,10 @@ jobs:
 
       - name: Concatenate and mux audio from source
         run: |
-          AUTH=$(printf 'Authorization: Bearer %s\r\n' "$HF_TOKEN")
           (cd parts && for f in part_*.mkv; do echo "file '$PWD/$f'"; done) > list.txt
           cat list.txt
           ffmpeg -v error -f concat -safe 0 -i list.txt \
-            -headers "$AUTH" -i "$SOURCE_URL" \
+            -headers "Authorization: Bearer $HF_TOKEN" -i "$SOURCE_URL" \
             -map 0:v:0 -map 1:a:0? -c copy -shortest \
             -y "$OUTPUT_NAME"
           ffprobe -v error -show_entries format=duration,size -of json "$OUTPUT_NAME"
