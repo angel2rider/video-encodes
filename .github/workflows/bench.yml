@@ -1,0 +1,96 @@
+name: bench-runners
+
+run-name: "Runner benchmark (${{ inputs.clip_seconds }}s @ ${{ inputs.seek_start }}s)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      seek_start:
+        description: "Seek offset into the source (seconds)"
+        default: "300"
+        required: true
+      clip_seconds:
+        description: "Clip length to encode (seconds)"
+        default: "60"
+        required: true
+      encoder_args:
+        description: "Identical encoder args for every runner"
+        default: "-c:v libx265 -preset medium -crf 24 -pix_fmt yuv420p10le"
+        required: true
+
+env:
+  SOURCE_URL: "https://huggingface.co/buckets/Angelrider/video-encodes/resolve/American.Psycho.2000.Unrated.2160p.UHD.BluRay.x265.HDR.DV.DD%2B7.1.Atmos-Pahe.in.mkv"
+  SEEK_START: ${{ inputs.seek_start }}
+  CLIP_SECONDS: ${{ inputs.clip_seconds }}
+  ENCODER_ARGS: ${{ inputs.encoder_args }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bench:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - windows-latest
+          - macos-latest
+    steps:
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: command -v ffmpeg >/dev/null || brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y
+
+      - name: Encode fixed clip and measure
+        run: |
+          echo "ffmpeg: $(ffmpeg -version | head -1)"
+          case "$(uname -s)" in
+            Linux*)     cpu="$(lscpu | awk -F: '/Model name/{gsub(/^ +/,"",$2); print $2; exit}') ($(nproc) vCPU)" ;;
+            Darwin*)    cpu="$(sysctl -n machdep.cpu.brand_string) (quota=$(sysctl -n hw.ncpu))" ;;
+            MINGW*|MSYS*|CYGWIN*) cpu="$PROCESSOR_IDENTIFIER ($NUMBER_OF_PROCESSORS threads)" ;;
+            *)          cpu="unknown" ;;
+          esac
+          echo "cpu: $cpu"
+
+          start=$(date +%s)
+          ffmpeg -y -stats \
+            -ss "$SEEK_START" -i "$SOURCE_URL" \
+            -t "$CLIP_SECONDS" -map 0:v:0 -an -sn \
+            $ENCODER_ARGS out.mkv 2> enc.log || { echo '--- ffmpeg tail ---'; tail -40 enc.log; exit 1; }
+          end=$(date +%s)
+          wall=$((end - start))
+
+          frames=$(ffprobe -v error -count_frames -select_streams v -show_entries stream=nb_read_frames -of csv=p=0 out.mkv)
+          size=$(stat -c%s out.mkv 2>/dev/null || stat -f%z out.mkv)
+          enc_speed=$(grep -o 'speed=[^ ]*' enc.log | tail -1 || true)
+          fps=$(awk "BEGIN{printf \"%.2f\", $frames/$wall}")
+          rt=$(awk "BEGIN{printf \"%.3f\", $CLIP_SECONDS/$wall}")
+          mbps=$(awk "BEGIN{printf \"%.1f\", $size*8/$wall/1000000}")
+
+          {
+            echo "## ${{ matrix.runner }}"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| cpu | $cpu |"
+            echo "| wall time | ${wall}s |"
+            echo "| frames | $frames |"
+            echo "| encode fps | $fps |"
+            echo "| realtime factor | ${rt}x |"
+            echo "| ffmpeg speed | ${enc_speed:-n/a} |"
+            echo "| output size | $((size / 1048576)) MB |"
+            echo "| effective throughput | ${mbps} Mbps |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
