@@ -73,7 +73,8 @@ jobs:
           end=$(date +%s)
           wall=$((end - start))
 
-          frames=$(ffprobe -v error -count_frames -select_streams v -show_entries stream=nb_read_frames -of csv=p=0 out.mkv)
+          frames=$(ffprobe -v error -count_frames -select_streams v -show_entries stream=nb_read_frames -of csv=p=0 out.mkv | tr -dc '0-9')
+          dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 out.mkv | tr -dc '0-9.')
           size=$(stat -c%s out.mkv 2>/dev/null || stat -f%z out.mkv)
           enc_speed=$(grep -o 'speed=[^ ]*' enc.log | tail -1 || true)
           fps=$(awk "BEGIN{printf \"%.2f\", $frames/$wall}")
@@ -88,6 +89,7 @@ jobs:
             echo "| cpu | $cpu |"
             echo "| wall time | ${wall}s |"
             echo "| frames | $frames |"
+            echo "| output duration | ${dur}s |"
             echo "| encode fps | $fps |"
             echo "| realtime factor | ${rt}x |"
             echo "| ffmpeg speed | ${enc_speed:-n/a} |"
