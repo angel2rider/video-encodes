@@ -1,0 +1,76 @@
+name: remux-audio-subs
+
+run-name: "${{ inputs.video_name }} + audio/subs -> ${{ inputs.output_name }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      bucket:
+        description: "HF bucket (owner/name)"
+        default: "Angelrider/video-encodes"
+        required: true
+      video_name:
+        description: "Video-only file in bucket root (e.g. fast encode output)"
+        default: "american-psycho-2000-1080p-opt.mkv"
+        required: true
+      source_path:
+        description: "Source file in bucket (audio/subs come from here)"
+        default: "American.Psycho.2000.Unrated.2160p.UHD.BluRay.x265.HDR.DV.DD+7.1.Atmos-Pahe.in.mkv"
+        required: true
+      output_name:
+        description: "Final filename (written to bucket root)"
+        default: "american-psycho-2000-1080p-final.mkv"
+        required: true
+
+jobs:
+  remux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      BUCKET: ${{ inputs.bucket }}
+      VIDEO_NAME: ${{ inputs.video_name }}
+      SOURCE_PATH: ${{ inputs.source_path }}
+      OUTPUT_NAME: ${{ inputs.output_name }}
+    steps:
+      - name: Ensure ffmpeg + hf
+        run: |
+          command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg)
+          ffmpeg -hide_banner -version | head -1
+          python3 -m pip install --user -U huggingface_hub
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download video-only file
+        run: |
+          echo "=== Downloading $VIDEO_NAME ==="
+          hf buckets cp "hf://buckets/$BUCKET/$VIDEO_NAME" "./video.mkv"
+          ls -lh video.mkv
+          ffprobe -v error -show_entries stream=index,codec_name,codec_type,width,height,pix_fmt -of flat video.mkv
+
+      - name: Mux audio + subtitles from source (no re-encode)
+        run: |
+          echo "=== video.mkv + audio/subs from source -> $OUTPUT_NAME ==="
+          SOURCE_URL=$(python3 -c "import urllib.parse,os; print('https://huggingface.co/buckets/' + os.environ['BUCKET'] + '/resolve/' + urllib.parse.quote(os.environ['SOURCE_PATH'], safe='/'))")
+          echo "source: $SOURCE_URL"
+          START_TS=$(date +%s)
+          ffmpeg -y -hide_banner -stats -stats_period 10 \
+            -i video.mkv \
+            -headers "Authorization: Bearer $HF_TOKEN" -i "$SOURCE_URL" \
+            -map 0:v:0 -map 1:a -map 1:s? -c copy \
+            "$OUTPUT_NAME" 2>&1
+          END_TS=$(date +%s)
+          echo "mux done in $((END_TS - START_TS))s"
+          ls -lh "$OUTPUT_NAME"
+          echo "--- streams (must be 1920x1080 hevc + audio + subs) ---"
+          ffprobe -v error -show_entries stream=index,codec_name,codec_type,width,height,pix_fmt -of flat "$OUTPUT_NAME"
+          ffprobe -v error -show_entries format=duration,size -of json "$OUTPUT_NAME"
+          {
+            echo "## Remux result"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| size | $(du -h "$OUTPUT_NAME" | cut -f1) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result
+        run: hf buckets cp "$OUTPUT_NAME" "hf://buckets/$BUCKET/$OUTPUT_NAME"

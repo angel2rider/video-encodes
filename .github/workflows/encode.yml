@@ -201,21 +201,24 @@ jobs:
           if [ "$need_bytes" -gt "$free_bytes" ]; then
             echo "::error::Not enough disk for concat (parts + output must fit in ~14GB runner)."
             echo "Merge locally instead: hf buckets sync hf://buckets/$BUCKET/parts/${{ github.run_id }} ./parts"
-            echo 'then: (cd parts && for f in part_*.mkv; do echo "file '"'"'$PWD/$f'"'"'"; done) > list.txt && ffmpeg -f concat -safe 0 -i list.txt -c copy OUTPUT.mkv'
+            echo 'then: (cd parts && for f in part_*.mkv; do echo "file '"'"'$PWD/$f'"'"'"; done) > list.txt && ffmpeg -f concat -safe 0 -i list.txt -i SOURCE_URL -map 0:v:0 -map 1:a -map 1:s? -c copy OUTPUT.mkv'
             exit 1
           fi
 
-      - name: Concatenate video-only (1080p 10-bit)
+      - name: Concatenate + mux audio/subs from source (1080p 10-bit)
         run: |
-          echo "=== Concat $N parts -> $OUTPUT_NAME (video-only) ==="
+          echo "=== Concat $N parts + mux audio/subs -> $OUTPUT_NAME ==="
           (cd parts && for f in part_*.mkv; do echo "file '$PWD/$f'"; done) > list.txt
           cat list.txt
           START_TS=$(date +%s)
-          ffmpeg -y -hide_banner -stats -stats_period 10 -f concat -safe 0 -i list.txt -c copy "$OUTPUT_NAME" 2>&1
+          ffmpeg -y -hide_banner -stats -stats_period 10 -f concat -safe 0 -i list.txt \
+            -headers "Authorization: Bearer $HF_TOKEN" -i "$SOURCE_URL" \
+            -map 0:v:0 -map 1:a -map 1:s? -c copy \
+            "$OUTPUT_NAME" 2>&1
           END_TS=$(date +%s)
-          echo "concat done in $((END_TS - START_TS))s"
+          echo "mux done in $((END_TS - START_TS))s"
           ls -lh "$OUTPUT_NAME"
-          echo "--- streams (must be 1920x1080 hevc) ---"
+          echo "--- streams (must be 1920x1080 hevc + audio + subs) ---"
           ffprobe -v error -show_entries stream=index,codec_name,codec_type,width,height,pix_fmt -of flat "$OUTPUT_NAME"
           ffprobe -v error -show_entries format=duration,size -of json "$OUTPUT_NAME"
           {
