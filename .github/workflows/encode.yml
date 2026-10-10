@@ -15,19 +15,19 @@ on:
         required: true
       output_name:
         description: "Filename for the encoded result (written to bucket root)"
-        default: "american-psycho-2000-encode.mkv"
+        default: "american-psycho-2000-1080p.mkv"
         required: true
       segments:
         description: "Number of parallel encode jobs (<=18 to stay inside Free concurrency)"
-        default: "8"
+        default: "18"
         required: true
       clip_seconds:
         description: "Encode only N seconds from the start of each segment (0 = full segments)"
-        default: "60"
+        default: "0"
         required: true
       encoder_args:
-        description: "ffmpeg encoder args applied identically to every segment (video only; audio is stream-copied at merge)"
-        default: "-c:v libx265 -preset medium -crf 24 -pix_fmt yuv420p10le"
+        description: "ffmpeg encoder args applied identically to every segment (video only; audio/subs are stream-copied at merge)"
+        default: "-c:v libx265 -preset medium -crf 20 -pix_fmt yuv420p10le -vf scale=1920:1080:flags=lanczos"
         required: true
 
 concurrency:
@@ -108,20 +108,37 @@ jobs:
       - name: Encode segment
         run: |
           NAME=$(printf 'part_%03d.mkv' "${{ matrix.part.i }}")
-          ffmpeg -y -v warning \
-            -ss "${{ matrix.part.start }}" \
-            -headers "Authorization: Bearer $HF_TOKEN" \
-            -i "${{ needs.probe.outputs.source_url }}" \
-            -t "${{ matrix.part.dur }}" \
-            -map 0:v:0 -an -sn \
-            $ENCODER_ARGS \
-            "$NAME"
-          ls -la "$NAME"
+          for attempt in 1 2 3; do
+            if ffmpeg -y -v warning \
+              -ss "${{ matrix.part.start }}" \
+              -headers "Authorization: Bearer $HF_TOKEN" \
+              -i "${{ needs.probe.outputs.source_url }}" \
+              -t "${{ matrix.part.dur }}" \
+              -map 0:v:0 -an -sn \
+              $ENCODER_ARGS \
+              "$NAME"; then
+              break
+            fi
+            echo "ffmpeg attempt $attempt failed, retrying in 10s..."
+            sleep 10
+            [ "$attempt" = 3 ] && exit 1
+          done
+          ls -lh "$NAME"
+          # validate part: must exist, non-empty, and have video duration > 0
+          test -s "$NAME"
+          ffprobe -v error -show_entries format=duration -of csv=p=0 "$NAME"
 
       - name: Upload segment to bucket
         run: |
           NAME=$(printf 'part_%03d.mkv' "${{ matrix.part.i }}")
-          hf buckets cp "$NAME" "hf://buckets/$BUCKET/parts/${{ github.run_id }}/$NAME"
+          for attempt in 1 2 3; do
+            if hf buckets cp "$NAME" "hf://buckets/$BUCKET/parts/${{ github.run_id }}/$NAME"; then
+              break
+            fi
+            echo "upload attempt $attempt failed, retrying in 10s..."
+            sleep 10
+            [ "$attempt" = 3 ] && exit 1
+          done
 
   merge:
     needs: [probe, encode]
@@ -158,18 +175,20 @@ jobs:
           if [ "$need_bytes" -gt "$free_bytes" ]; then
             echo "::error::Not enough disk for concat (parts + output must fit in ~14GB runner)."
             echo "Merge locally instead: hf buckets sync hf://buckets/$BUCKET/parts/${{ github.run_id }} ./parts"
-            echo "then: ffmpeg -f concat -safe 0 -i list.txt -i \"$SOURCE_URL\" -map 0:v:0 -map 1:a:0? -c copy -shortest \"$OUTPUT_NAME\""
+            echo "then: ffmpeg -f concat -safe 0 -i list.txt -i \"$SOURCE_URL\" -map 0:v:0 -map 1:a -map 1:s? -c copy -shortest \"$OUTPUT_NAME\""
             exit 1
           fi
 
-      - name: Concatenate and mux audio from source
+      - name: Concatenate and mux audio + subtitles from source
         run: |
           (cd parts && for f in part_*.mkv; do echo "file '$PWD/$f'"; done) > list.txt
           cat list.txt
           ffmpeg -v error -f concat -safe 0 -i list.txt \
             -headers "Authorization: Bearer $HF_TOKEN" -i "$SOURCE_URL" \
-            -map 0:v:0 -map 1:a:0? -c copy -shortest \
+            -map 0:v:0 -map 1:a -map 1:s? -c copy -shortest \
             -y "$OUTPUT_NAME"
+          echo "--- streams ---"
+          ffprobe -v error -show_entries stream=index,codec_name,codec_type,width,height -of flat "$OUTPUT_NAME"
           ffprobe -v error -show_entries format=duration,size -of json "$OUTPUT_NAME"
 
       - name: Upload result
